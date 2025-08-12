@@ -1,0 +1,52 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+*.env
+
+# Google API credentials
+credentials.json
+token.json
+
+# Personal files
+*.pdf
+resume_*.pdf
+
+# Database files
+chroma_resume/
+*.sqlite3
+
+# Email history (may contain sensitive data)
+email_history.json
+email_history.json.backup
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+temp_*
+*.tmp
+*.temp
