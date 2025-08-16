@@ -2,8 +2,9 @@ import streamlit as st
 import os
 import json
 import pypdf
-import requests
-from bs4 import BeautifulSoup
+import re
+import base64
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Google Auth imports
@@ -25,13 +26,6 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 
-# Search imports
-from langchain_community.utilities import SerpAPIWrapper
-try:
-    from langchain.tools import Tool
-except Exception:
-    from langchain_core.tools import Tool
-
 # === Configuration ===
 CONFIG_FILE = "resume_config.json"
 DB_PATH = "./chroma_resume"
@@ -41,15 +35,6 @@ CREDS_FILE = "credentials.json"
 SCOPES = ["https://mail.google.com/"]
 
 load_dotenv()
-
-# Only set environment variables if they exist in .env file
-google_api_key = os.getenv("GOOGLE_API_KEY")
-serpapi_api_key = os.getenv("SERP_API_KEY")  # Note: using SERP_API_KEY to match .env file
-
-if google_api_key:
-    os.environ["GOOGLE_API_KEY"] = google_api_key
-if serpapi_api_key:
-    os.environ["SERPAPI_API_KEY"] = serpapi_api_key
 
 # === Utility Functions ===
 def load_email_history():
@@ -85,236 +70,11 @@ def extract_text_from_pdf(file_path):
             text += page.extract_text() or ""
     return text.strip()
 
-def validate_url(url):
-    """Simple URL validation and correction"""
-    if not url:
-        return None
-    
-    url = url.strip()
-    if not url:
-        return None
-    
-    # Add protocol if missing
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-    
-    # Basic URL pattern check
-    import re
-    url_pattern = re.compile(
-        r'^https?://'  # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
-        r'localhost|'  # localhost...
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
-        r'(?::\d+)?'  # optional port
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    
-    if url_pattern.match(url):
-        return url
-    else:
-        return None
-
-def scrape_job_description(url):
-    """Scrape job description from URL with site-specific strategies and JS handling"""
-    try:
-        # Check if this might be a JavaScript-heavy site
-        if any(site in url.lower() for site in ['naukri.com', 'linkedin.com', 'indeed.com']):
-            st.info("Detected JavaScript-heavy job site. The extracted content might be limited.")
-            st.info("💡 **Tip**: For best results, copy the job description manually and paste it in the text area.")
-        
-        # Enhanced headers to avoid blocking
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-        }
-        
-        # Make request with session for better handling
-        session = requests.Session()
-        session.headers.update(headers)
-        
-        response = session.get(url, timeout=15, allow_redirects=True)
-        response.raise_for_status()
-        
-        # Debug: Show response status
-        st.info(f"Successfully fetched URL (Status: {response.status_code})")
-        
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Check if page is JavaScript-heavy
-        script_count = len(soup.find_all('script'))
-        if script_count > 15:
-            st.warning(f"⚠️ This page has {script_count} script tags and likely uses JavaScript rendering. Manual input is recommended.")
-        
-        # Generic extraction strategy only
-        job_text = ""
-        
-        # Strategy 2: Generic job description selectors
-        if not job_text:
-            job_selectors = [
-                # Job description specific
-                '[class*="job-description"]', '[id*="job-description"]', '[class*="jobdescription"]',
-                '[class*="job-detail"]', '[class*="job-content"]', '[class*="description"]',
-                '[data-testid*="job"]', '[data-test*="job"]', '[class*="posting"]',
-                
-                # Content areas
-                'main article', 'main section', '[role="main"]', '.main-content',
-                '[class*="content"]', '[class*="details"]', '[class*="info"]',
-                
-                # Broader fallbacks
-                'main', 'article', '.container', '.content'
-            ]
-            
-            for selector in job_selectors:
-                elements = soup.select(selector)
-                if elements:
-                    for element in elements:
-                        text = element.get_text(strip=True)
-                        if len(text) > 300 and has_job_keywords(text):  # More content + job keywords
-                            job_text = text
-                            st.info(f"Found content using selector: {selector}")
-                            break
-                    if job_text:
-                        break
-        
-        # Strategy 3: Try to extract from meta tags or structured data
-        if not job_text:
-            job_text = extract_from_meta_tags(soup)
-        
-        # Strategy 4: Extract from body if nothing else works
-        if not job_text:
-            st.warning("Using fallback extraction method...")
-            job_text = extract_from_body(soup)
-        
-        # Clean and validate the extracted text
-        if job_text:
-            cleaned_text = clean_job_text(job_text)
-            
-            if len(cleaned_text) < 100:
-                st.warning(f"Retrieved text seems too short ({len(cleaned_text)} chars). For JavaScript-heavy sites like Naukri, manual input works better.")
-                return cleaned_text if cleaned_text else None
-            
-            # Final validation
-            if not has_job_keywords(cleaned_text):
-                st.warning("The extracted text doesn't seem to contain typical job description content. Please use manual input.")
-                return cleaned_text  # Return anyway, let user decide
-            
-            st.success(f"Successfully extracted {len(cleaned_text)} characters from the job posting")
-            return cleaned_text
-        else:
-            st.error("No meaningful content found on the page. Please copy the job description manually.")
-            return None
-        
-    except requests.exceptions.RequestException as e:
-        st.error(f"Network error while fetching job description: {e}")
-        return None
-    except Exception as e:
-        st.error(f"Error parsing job description: {e}")
-        return None
-
-def extract_from_meta_tags(soup):
-    """Try to extract job info from meta tags"""
-    job_text = ""
-    
-    # Check meta description
-    meta_desc = soup.find('meta', attrs={'name': 'description'})
-    if meta_desc and meta_desc.get('content'):
-        content = meta_desc.get('content')
-        if len(content) > 100 and has_job_keywords(content):
-            job_text += content + " "
-    
-    # Check Open Graph description
-    og_desc = soup.find('meta', attrs={'property': 'og:description'})
-    if og_desc and og_desc.get('content'):
-        content = og_desc.get('content')
-        if len(content) > 100 and has_job_keywords(content):
-            job_text += content + " "
-    
-    # Check for JSON-LD structured data
-    json_scripts = soup.find_all('script', type='application/ld+json')
-    for script in json_scripts:
-        try:
-            import json
-            data = json.loads(script.string)
-            if isinstance(data, dict) and 'description' in data:
-                desc = data['description']
-                if isinstance(desc, str) and len(desc) > 100:
-                    job_text += desc + " "
-        except:
-            continue
-    
-    return job_text.strip()
-
-def extract_from_body(soup):
-    """Fallback extraction from body content"""
-    # Remove unwanted elements
-    for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'form', 'button']):
-        element.decompose()
-    
-    # Get text from body
-    body = soup.find('body') or soup
-    return body.get_text()
-
-def has_job_keywords(text):
-    """Check if text contains job-related keywords"""
-    job_keywords = [
-        'job', 'position', 'role', 'responsibilities', 'requirements', 'qualifications',
-        'experience', 'skills', 'company', 'work', 'employment', 'candidate', 'team',
-        'salary', 'benefits', 'apply', 'hiring', 'career', 'opportunity', 'developer',
-        'engineer', 'manager', 'analyst', 'intern', 'graduate', 'senior', 'junior'
-    ]
-    
-    text_lower = text.lower()
-    keyword_count = sum(1 for keyword in job_keywords if keyword in text_lower)
-    return keyword_count >= 3
-
-def clean_job_text(text):
-    """Clean and process job description text"""
-    # Split into lines and filter
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    
-    # Remove very short lines and navigation elements
-    filtered_lines = []
-    for line in lines:
-        if len(line) < 15:  # Skip very short lines
-            continue
-        
-        # Skip navigation/UI elements
-        skip_phrases = [
-            'cookie', 'privacy', 'terms', 'copyright', 'sign in', 'log in', 'register',
-            'subscribe', 'newsletter', 'social media', 'follow us', 'contact us',
-            'about us', 'careers', 'help', 'support', 'menu', 'navigation', 'search',
-            'filter', 'sort by', 'page', 'next', 'previous', 'home', 'back to top',
-            'share', 'print', 'save', 'bookmark', 'report', 'flag'
-        ]
-        
-        line_lower = line.lower()
-        if not any(phrase in line_lower for phrase in skip_phrases):
-            filtered_lines.append(line)
-    
-    # Join lines
-    cleaned_text = ' '.join(filtered_lines)
-    
-    # Clean up spacing and characters
-    import re
-    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-    
-    # Limit length
-    if len(cleaned_text) > 6000:
-        cleaned_text = cleaned_text[:6000] + "..."
-    
-    return cleaned_text
-
 class JobApplicationAgent:
     """
     Job Application Agent that handles:
     1. Resume processing and storage for attachment
-    2. Job description extraction from URLs
+    2. Manual job description input only
     3. Resume-job matching analysis
     4. Professional email generation
     5. Email sending/drafting with PDF attachments
@@ -324,7 +84,8 @@ class JobApplicationAgent:
     - attach_and_send_email() handles PDF attachment and sending
     - _send_email_with_attachment() is the internal Gmail agent function
     """
-    def __init__(self):
+    def __init__(self, google_api_key=None):
+        self.google_api_key = google_api_key
         self.setup_environment()
         self.gmail_tools = None
         self.resume_text = None
@@ -332,15 +93,9 @@ class JobApplicationAgent:
         self.job_description = None
         
     def setup_environment(self):
-        """Setup API keys and authentication"""
-        self.google_api_key = os.getenv("GOOGLE_API_KEY")
-        self.serpapi_key = os.getenv("SERP_API_KEY")  # Note: using SERP_API_KEY to match .env file
-        
-        # Only set environment variables if they exist
+        """Setup API keys and authentication from session"""
         if self.google_api_key:
             os.environ["GOOGLE_API_KEY"] = self.google_api_key
-        if self.serpapi_key:
-            os.environ["SERPAPI_API_KEY"] = self.serpapi_key
     
     def setup_gmail_auth(self):
         """Setup Gmail authentication"""
@@ -385,32 +140,16 @@ class JobApplicationAgent:
         except Exception as e:
             return False, f"Error processing resume: {e}"
     
-    def fetch_job_description(self, job_url):
-        """Fetch job description from URL with enhanced error handling"""
+    def set_job_description(self, job_description):
+        """Set job description manually"""
         try:
-            if not job_url or not job_url.strip():
-                return False, "Please provide a valid job URL"
+            if not job_description or not job_description.strip():
+                return False, "Please provide a job description"
             
-            # Validate and fix URL format
-            validated_url = validate_url(job_url)
-            if not validated_url:
-                return False, "Invalid URL format. Please check the URL and try again."
-            
-            st.info(f"Attempting to fetch job description from: {validated_url}")
-            
-            self.job_description = scrape_job_description(validated_url)
-            
-            if self.job_description and len(self.job_description.strip()) > 50:
-                # Show preview of extracted content for debugging
-                preview = self.job_description[:500] + "..." if len(self.job_description) > 500 else self.job_description
-                with st.expander("📝 Preview of extracted job description (click to expand)"):
-                    st.text_area("Extracted content:", value=preview, height=150, disabled=True)
-                return True, f"Job description fetched successfully! ({len(self.job_description)} characters)"
-            else:
-                return False, f"Could not fetch meaningful job description from URL. Try using the manual input option below."
-                
+            self.job_description = job_description.strip()
+            return True, f"Job description set successfully! ({len(self.job_description)} characters)"
         except Exception as e:
-            return False, f"Error fetching job description: {str(e)}"
+            return False, f"Error setting job description: {e}"
     
     def analyze_job_match(self):
         """Analyze resume against job description with improved error handling"""
@@ -604,14 +343,14 @@ class JobApplicationAgent:
                 
                 simple_body = f"""Dear Hiring Team,
 
-I am interested in applying for the position at your company.
+                    I am interested in applying for the position at your company.
 
-My background and experience are outlined in the attached resume. I would appreciate the opportunity to discuss my qualifications with you.
+                    My background and experience are outlined in the attached resume. I would appreciate the opportunity to discuss my qualifications with you.
 
-Thank you for your consideration.
+                    Thank you for your consideration.
 
-Best regards,
-{candidate_name}"""
+                    Best regards,
+                    {candidate_name}"""
                 
                 formatted_body = self._format_business_letter(simple_body)
                 return True, {"subject": subject, "body": formatted_body}
@@ -767,7 +506,7 @@ def main():
         page_title="Smart Job Application Agent", 
         page_icon="🚀", 
         layout="wide",
-        initial_sidebar_state="collapsed"
+        initial_sidebar_state="expanded"
     )
     
     # Custom CSS for better styling
@@ -775,17 +514,68 @@ def main():
     <style>
     .main-header {
         text-align: center;
-        padding: 2rem 0;
+        padding: 0.8rem 0;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
+        border-radius: 20px;
+        margin-bottom: 1rem;
+        height: 100px;
+    }
+    .status-box {
+        background: white;
+        border: 2px solid #e9ecef;
         border-radius: 10px;
-        margin-bottom: 2rem;
+        padding: .1rem 3rem;
+        margin: 0.1rem 20rem;
+        text-align: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        color: #000000 !important;
+    }
+    .status-box h4 {
+        color: #000000 !important;
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+    }
+    .status-box h3 {
+        color: #000000 !important;
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+    }
+    .status-box p {
+        color: #000000 !important;
+        margin: 0.25rem 0 0 0;
+        font-size: 0.85rem;
+    }
+    .status-active {
+        background: #e3f2fd;
+        border: 2px solid #1976d2;
+    }
+    .status-active h4, .status-active p {
+        color: #1976d2 !important;
+    }
+    .status-success {
+        background: #e8f5e8;
+        border: 2px solid #4caf50;
+    }
+    .status-success h3, .status-success h4, .status-success p {
+        color: #2e7d32 !important;
+    }
+    .status-error {
+        background: #ffebee;
+        border: 2px solid #f44336;
+    }
+    .status-error h3, .status-error h4, .status-error p {
+        color: #c62828 !important;
     }
     .input-section {
-        background: #f8f9fa;
+        background: transparent !important;
         padding: 1.5rem;
         border-radius: 10px;
         margin-bottom: 1rem;
+        border: none !important;
+        box-shadow: none !important;
     }
     .success-box {
         background: #d4edda;
@@ -803,34 +593,82 @@ def main():
         border-radius: 5px;
         margin: 1rem 0;
     }
+    
+    /* Custom styling for sidebar warning box */
+    .sidebar .stAlert > div {
+        font-size: 0.75rem !important;
+        padding: 0.5rem !important;
+        margin: 0.25rem 0 !important;
+        line-height: 1.2 !important;
+    }
+    
+    /* Alternative: Target warning specifically */
+    div[data-testid="stAlert"] div {
+        font-size: 0.75rem !important;
+        padding: 0.5rem 0.75rem !important;
+        margin: 0.25rem 0 !important;
+    }
     </style>
     """, unsafe_allow_html=True)
     
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>🚀 Smart Job Application Agent</h1>
-        <p>Upload Resume → Paste Job URL → Enter Email → Get Professional Results!</p>
+        <h4>🚀 Smart Job Application Agent</h4>
+        <p>Upload Resume → Paste Job Description → Enter Email → Get Professional Results!</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Initialize agent
-    agent = JobApplicationAgent()
-    
-    # API Keys check
-    if not agent.google_api_key or not agent.serpapi_key:
-        st.error("⚠️ Please set GOOGLE_API_KEY and SERPAPI_API_KEY in your .env file")
-        st.stop()
-    
-    # Gmail setup
-    gmail_status, gmail_msg = agent.setup_gmail_auth()
-    if gmail_status:
-        st.success(f"✅ {gmail_msg}")
-    else:
-        st.warning(f"⚠️ {gmail_msg}")
+    # Sidebar for API Key and Email History
+    with st.sidebar:
+        st.markdown("### 🔑 API Configuration")
+        google_api_key = st.text_input(
+            "Google API Key", 
+            type="password", 
+            placeholder="Enter your Google Gemini API key here...",
+            help="Get your API key from Google AI Studio",
+            key="api_key_input"
+        )
+        
+        if not google_api_key:
+            st.markdown('<div style="background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; margin: 0.25rem 0;">Google API key to continue.</div>', unsafe_allow_html=True)
+            st.stop()
+        
+        # Initialize agent with API key
+        agent = JobApplicationAgent(google_api_key=google_api_key)
+        
+        # Gmail setup
+        gmail_status, gmail_msg = agent.setup_gmail_auth()
+        if gmail_status:
+            st.markdown('<div style="background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; margin: 0.25rem 0;">Gmail connected successfully!</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; margin: 0.25rem 0;">⚠️ Gmail connection failed</div>', unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Email History in sidebar
+        if st.checkbox("📊 Show Email History"):
+            history = load_email_history()
+            if history:
+                st.markdown("### 📜 Recent Emails")
+                for i, email in enumerate(reversed(history[-5:]), 1):
+                    if isinstance(email, dict):
+                        with st.expander(f"Email {i}"):
+                            st.write(f"**To:** {email.get('recipient', 'Unknown')}")
+                            st.write(f"**Subject:** {email.get('subject', 'No Subject')}")
+                            st.write(f"**Action:** {email.get('action', 'Unknown')}")
+            else:
+                st.info("No email history found.")
     
     # Main input form
     with st.form("job_application_form", clear_on_submit=False):
+        # Status Display Box - Default state (inside form)
+        st.markdown("""
+        <div class="status-box">
+            <h4>🎯 Ready to Process Your Application</h4>
+        </div>
+        """, unsafe_allow_html=True)
+        
         st.markdown('<div class="input-section">', unsafe_allow_html=True)
         
         # Three main inputs
@@ -838,23 +676,19 @@ def main():
         
         with col1:
             st.markdown("### 📄 Upload Resume")
-            uploaded_file = st.file_uploader("Choose PDF file", type="pdf", help="Upload your resume in PDF format")
+            uploaded_file = st.file_uploader("Choose PDF file", type="pdf", help="Upload your resume in PDF format", key="resume_upload")
         
         with col2:
-            st.markdown("### 🔗 Job Post URL")
-            job_url = st.text_input("Job posting URL", placeholder="https://company.com/job-posting", help="Paste the full URL of the job posting")
-            
-            # Add option for manual job description input
-            st.markdown("**OR**")
-            st.info("💡 **For JavaScript-heavy sites**: Copy the job description from the website and paste it here for best results!")
-            manual_job_desc = st.text_area("Paste Job Description Manually", 
+            st.markdown("### 📝 Job Description")
+            manual_job_desc = st.text_area("Paste Job Description", 
                                          placeholder="Copy the complete job description from any job site and paste here...", 
-                                         height=120, 
-                                         help="This is the recommended approach for sites that load content dynamically")
+                                         height=100, 
+                                         help="Copy the full job description text from the job posting",
+                                         key="job_desc_input")
         
         with col3:
             st.markdown("### 📧 Recipient Email")
-            recipient_email = st.text_input("Recruiter's email", placeholder="recruiter@company.com", help="Enter the recruiter's email address")
+            recipient_email = st.text_input("Recruiter's email", placeholder="recruiter@company.com", help="Enter the recruiter's email address", key="email_input")
         
         st.markdown('</div>', unsafe_allow_html=True)
         
@@ -872,13 +706,42 @@ def main():
     
     # Process actions
     if analyze_clicked or draft_clicked or send_clicked:
+        # Determine which task is being performed
+        current_task = 'analyze' if analyze_clicked else ('draft' if draft_clicked else 'send')
+        
+        # Update status display
+        task_descriptions = {
+            'analyze': {'emoji': '🔍', 'title': 'Analyzing Job Match', 'desc': 'Comparing your resume with the job requirements to find matches and suggestions'},
+            'draft': {'emoji': '📝', 'title': 'Creating Email Draft', 'desc': 'Generating professional email draft with your resume attached'},
+            'send': {'emoji': '📨', 'title': 'Sending Email', 'desc': 'Sending professional email with resume attachment to the recruiter'}
+        }
+        
+        task_info = task_descriptions[current_task]
+        
+        # Create a status container that we can update
+        status_container = st.empty()
+        
+        # Show current task status
+        status_container.markdown(f"""
+        <div class="status-box status-active">
+            <h4>{task_info['emoji']} {task_info['title']} ...</h4>
+            <p>{task_info['desc']}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Initialize session state for results
+        if 'analysis_result' not in st.session_state:
+            st.session_state.analysis_result = None
+        if 'email_content' not in st.session_state:
+            st.session_state.email_content = None
+        
         # Validate inputs
         if not uploaded_file:
             st.error("❌ Please upload your resume")
             st.stop()
         
-        if not job_url and not manual_job_desc:
-            st.error("❌ Please provide either a job posting URL or paste the job description manually")
+        if not manual_job_desc:
+            st.error("❌ Please paste the job description in the text area")
             st.stop()
         
         if (draft_clicked or send_clicked) and not recipient_email:
@@ -903,25 +766,16 @@ def main():
                 st.error(f"❌ {resume_msg}")
                 st.stop()
             
-            # Step 2: Fetch Job Description
-            status_text.text("🔗 Fetching job description...")
+            # Step 2: Set Job Description
+            status_text.text("📝 Processing job description...")
             progress_bar.progress(40)
             
-            # Use manual job description if provided, otherwise scrape URL
-            if manual_job_desc and manual_job_desc.strip():
-                agent.job_description = manual_job_desc.strip()
-                job_success = True
-                job_msg = f"Manual job description loaded successfully! ({len(agent.job_description)} characters)"
-                st.info("✅ Using manually provided job description")
-            elif job_url:
-                job_success, job_msg = agent.fetch_job_description(job_url)
-            else:
-                job_success = False
-                job_msg = "No job description provided"
-            
+            job_success, job_msg = agent.set_job_description(manual_job_desc)
             if not job_success:
                 st.error(f"❌ {job_msg}")
                 st.stop()
+            
+            st.info("✅ Job description loaded successfully")
             
             # Step 3: Analyze Match (always do this)
             status_text.text("🔍 Analyzing job match...")
@@ -932,9 +786,8 @@ def main():
                 st.error(f"❌ {analysis_result}")
                 st.stop()
             
-            # Display analysis results
-            st.markdown("### 📊 Job Match Analysis")
-            st.markdown(f'<div class="success-box">{analysis_result}</div>', unsafe_allow_html=True)
+            # Store analysis result in session state
+            st.session_state.analysis_result = analysis_result
             
             # Step 4: Email actions (if requested)
             if draft_clicked or send_clicked:
@@ -946,11 +799,8 @@ def main():
                     st.error(f"❌ {email_content}")
                     st.stop()
                 
-                # Display generated email
-                st.markdown("### 📧 Generated Email")
-                st.markdown(f"**Subject:** {email_content['subject']}")
-                st.markdown("**Body:**")
-                st.text_area("Email content", value=email_content['body'], height=200, disabled=True)
+                # Store email content in session state
+                st.session_state.email_content = email_content
                 
                 # Now use the attachment function to send/draft
                 action = "draft" if draft_clicked else "send"
@@ -969,6 +819,17 @@ def main():
                 if send_success:
                     success_msg = f"✅ Email {'drafted' if draft_clicked else 'sent'} successfully with PDF attachment!"
                     st.markdown(f'<div class="success-box">{success_msg}<br><small>{send_result}</small></div>', unsafe_allow_html=True)
+                    
+                    # Save to email history
+                    save_email_history({
+                        "recipient": recipient_email,
+                        "subject": email_content['subject'],
+                        "body": email_content['body'][:200] + "..." if len(email_content['body']) > 200 else email_content['body'],
+                        "action": action,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    
+
                 else:
                     st.error(f"❌ {send_result}")
             else:
@@ -976,23 +837,43 @@ def main():
             
             status_text.text("✅ Process completed!")
             
+            # Show completion status in the same status container
+            task_success = {
+                'analyze': {'emoji': '✅', 'title': 'Job Match Analysis Completed', 'desc': 'Resume analysis and job matching completed successfully'},
+                'draft': {'emoji': '✅', 'title': 'Email Draft Created', 'desc': 'Professional email draft has been created and saved to Gmail'},
+                'send': {'emoji': '✅', 'title': 'Email Sent Successfully', 'desc': 'Your professional email with resume has been sent to the recruiter'}
+            }
+            
+            success_info = task_success[current_task]
+            
+            status_container.markdown(f"""
+            <div class="status-box status-success">
+                <h4>{success_info['emoji']} {success_info['title']}</h4>
+                <p>{success_info['desc']}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
         except Exception as e:
             st.error(f"❌ An unexpected error occurred: {e}")
+            
+            # Show error status in the same container
+            status_container.markdown(f"""
+            <div class="status-box status-error">
+                <h4>❌ Task Failed</h4>
+                <p>An error occurred while processing your request. Please check your inputs and try again.</p>
+            </div>
+            """, unsafe_allow_html=True)
     
-    # Email History
-    if st.checkbox("📊 Show Email History"):
-        history = load_email_history()
-        if history:
-            st.markdown("### 📜 Recent Email History")
-            for i, email in enumerate(reversed(history[-5:]), 1):
-                if isinstance(email, dict):
-                    with st.expander(f"Email {i}: {email.get('subject', 'No Subject')} ({email.get('action', 'unknown')})"):
-                        st.write(f"**To:** {email.get('recipient', 'Unknown')}")
-                        st.write(f"**Subject:** {email.get('subject', 'No Subject')}")
-                        st.write(f"**Action:** {email.get('action', 'Unknown')}")
-                        st.write(f"**Body:** {email.get('body', 'No content')[:200]}...")
-        else:
-            st.info("No email history found.")
+    # Display persistent results
+    if st.session_state.get('analysis_result'):
+        st.markdown("### � Job Match Analysis")
+        st.markdown(f'<div class="success-box">{st.session_state.analysis_result}</div>', unsafe_allow_html=True)
+    
+    if st.session_state.get('email_content'):
+        st.markdown("### 📧 Generated Email")
+        st.markdown(f"**Subject:** {st.session_state.email_content['subject']}")
+        st.markdown("**Body:**")
+        st.text_area("Email content", value=st.session_state.email_content['body'], height=200, disabled=True, key="email_preview")
 
 if __name__ == "__main__":
     main()
