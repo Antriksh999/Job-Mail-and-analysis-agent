@@ -1,11 +1,8 @@
 import streamlit as st
 import os
-import json
 import pypdf
-import re
-import base64
+import json
 from datetime import datetime
-from dotenv import load_dotenv
 
 # Google Auth imports
 from google.auth.transport.requests import Request
@@ -13,54 +10,49 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 # LangChain imports
-from langchain_google_community import GmailToolkit
-from langchain_google_community.gmail.utils import build_resource_service
-from langchain.agents import initialize_agent, AgentType
-from langchain.memory import ConversationBufferWindowMemory
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-
-# Resume processing imports
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 # === Configuration ===
-CONFIG_FILE = "resume_config.json"
-DB_PATH = "./chroma_resume"
-HISTORY_FILE = "email_history.json"
 TOKEN_FILE = "token.json"
 CREDS_FILE = "credentials.json"
 SCOPES = ["https://mail.google.com/"]
 
-load_dotenv()
 
-# === Utility Functions ===
-def load_email_history():
-    if os.path.exists(HISTORY_FILE):
+# === Session-based Storage Functions ===
+def init_session_history():
+    """Initialize session-based activity history"""
+    if 'activity_history' not in st.session_state:
+        st.session_state.activity_history = []
+
+def add_to_session_history(entry):
+    """Add entry to session-based history"""
+    if 'activity_history' not in st.session_state:
+        st.session_state.activity_history = []
+    
+    # Add timestamp
+    entry['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Add to beginning of list (most recent first)
+    st.session_state.activity_history.insert(0, entry)
+    
+    # Keep only last 10 entries to manage memory
+    if len(st.session_state.activity_history) > 10:
+        st.session_state.activity_history = st.session_state.activity_history[:10]
+
+def clear_session_data():
+    """Clear all session data including persistent inputs"""
+    keys_to_clear = ['activity_history', 'analysis_result', 'email_content', 'credentials_content',
+                     'job_desc_text', 'recipient_email_text', 'uploaded_file_data', 'uploaded_file_name']
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+    
+    # Also remove credentials.json file if it exists
+    if os.path.exists("credentials.json"):
         try:
-            with open(HISTORY_FILE, "r") as f:
-                content = f.read().strip()
-                if not content:
-                    return []
-                return json.loads(content)
-        except (json.JSONDecodeError, Exception) as e:
-            st.warning(f"Email history file corrupted, creating new one.")
-            if os.path.exists(HISTORY_FILE):
-                os.rename(HISTORY_FILE, f"{HISTORY_FILE}.backup")
-            return []
-    return []
-
-def save_email_history(new_entry):
-    try:
-        history = load_email_history()
-        history.append(new_entry)
-        history = history[-10:]
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f, indent=2)
-    except Exception as e:
-        st.error(f"Failed to save email history: {e}")
+            os.remove("credentials.json")
+        except:
+            pass  # Ignore errors if file can't be removed
 
 def extract_text_from_pdf(file_path):
     with open(file_path, "rb") as pdf_file:
@@ -84,10 +76,12 @@ class JobApplicationAgent:
     - attach_and_send_email() handles PDF attachment and sending
     - _send_email_with_attachment() is the internal Gmail agent function
     """
-    def __init__(self, google_api_key=None):
+    def __init__(self, google_api_key=None, sender_email=None):
         self.google_api_key = google_api_key
+        self.sender_email = sender_email
         self.setup_environment()
         self.gmail_tools = None
+        self.gmail_credentials = None  # Store session-based Gmail credentials
         self.resume_text = None
         self.resume_file_path = None
         self.job_description = None
@@ -98,29 +92,41 @@ class JobApplicationAgent:
             os.environ["GOOGLE_API_KEY"] = self.google_api_key
     
     def setup_gmail_auth(self):
-        """Setup Gmail authentication"""
+        """Setup Gmail authentication using session-based credentials"""
         try:
+            # Check if credentials are available in session
+            if 'credentials_content' not in st.session_state:
+                return False, "Gmail credentials not uploaded. Please upload credentials.json file."
+            
+            # Use session-based credentials
             creds = None
-            if os.path.exists(TOKEN_FILE):
-                creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            
+            # Check for existing token in session
+            if 'gmail_token' in st.session_state:
+                try:
+                    creds = Credentials.from_authorized_user_info(st.session_state.gmail_token, SCOPES)
+                except Exception:
+                    # Token invalid, will need to re-authenticate
+                    pass
+            
+            # If no valid credentials, authenticate using uploaded credentials
             if not creds or not creds.valid:
                 if creds and creds.expired and creds.refresh_token:
                     creds.refresh(Request())
                 else:
-                    if os.path.exists(CREDS_FILE):
-                        flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-                        creds = flow.run_local_server(port=0)
-                    else:
-                        return False, "Gmail credentials.json file not found."
-                with open(TOKEN_FILE, "w") as token:
-                    token.write(creds.to_json())
+                    # Create flow using session credentials
+                    flow = InstalledAppFlow.from_client_config(st.session_state.credentials_content, SCOPES)
+                    creds = flow.run_local_server(port=0)
+                
+                # Store token in session (not file)
+                st.session_state.gmail_token = json.loads(creds.to_json())
             
-            api_resource = build_resource_service(credentials=creds)
-            toolkit = GmailToolkit(api_resource=api_resource)
-            self.gmail_tools = toolkit.get_tools()
+            # Store credentials for use in email functions
+            self.gmail_credentials = creds
             return True, "Gmail connected successfully!"
+            
         except Exception as e:
-            return False, f"Failed to setup Gmail: {e}"
+            return False, f"Failed to setup Gmail: {str(e)}"
     
     def process_resume(self, uploaded_file):
         """Process uploaded resume and save file for attachment"""
@@ -399,10 +405,57 @@ class JobApplicationAgent:
         # Join paragraphs with double line breaks
         return '\n\n'.join(paragraphs)
     
+    def _convert_to_html_format(self, plain_text):
+        """Convert plain text email to HTML format for better display"""
+        import html
+        
+        # Escape HTML characters
+        html_content = html.escape(plain_text)
+        
+        # Convert line breaks to HTML
+        # Double line breaks become paragraph breaks
+        html_content = html_content.replace('\n\n', '</p><p>')
+        # Single line breaks become <br> tags
+        html_content = html_content.replace('\n', '<br>')
+        
+        # Wrap in HTML structure with professional styling
+        html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #333333;
+            margin: 20px;
+            background-color: #ffffff;
+        }}
+        p {{
+            margin: 16px 0;
+            text-align: left;
+        }}
+        .greeting {{
+            margin-bottom: 20px;
+        }}
+        .signature {{
+            margin-top: 30px;
+        }}
+    </style>
+</head>
+<body>
+    <p>{html_content}</p>
+</body>
+</html>"""
+        
+        return html_body
+    
     def send_email(self, recipient_email, email_content, action="draft"):
         """Send or draft email using Gmail with PDF attachment and plain text format"""
         try:
-            if not self.gmail_tools:
+            if not self.gmail_credentials:
                 return False, "Gmail not connected"
             
             if not self.resume_file_path or not os.path.exists(self.resume_file_path):
@@ -417,13 +470,10 @@ class JobApplicationAgent:
     def _send_email_with_attachment(self, recipient_email, email_content, attachment_path, action="draft"):
         """Internal function to handle email with PDF attachment using direct Gmail API"""
         try:
-            # Get Gmail credentials
-            creds = None
-            if os.path.exists(TOKEN_FILE):
-                creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-            
+            # Use session-based Gmail credentials
+            creds = self.gmail_credentials
             if not creds or not creds.valid:
-                return False, "Gmail credentials not available"
+                return False, "Gmail credentials not available. Please reconnect to Gmail."
             
             # Build Gmail service directly
             from googleapiclient.discovery import build
@@ -436,13 +486,23 @@ class JobApplicationAgent:
             from email.mime.base import MIMEBase
             from email import encoders
             
-            # Create message
+            # Create main message container
             msg = MIMEMultipart()
             msg['to'] = recipient_email
             msg['subject'] = email_content['subject']
             
-            # Add body
-            msg.attach(MIMEText(email_content['body'], 'plain'))
+            # Create alternative container for text/html versions
+            msg_alternative = MIMEMultipart('alternative')
+            
+            # Add plain text version (fallback)
+            msg_alternative.attach(MIMEText(email_content['body'], 'plain'))
+            
+            # Add HTML version (preferred)
+            html_body = self._convert_to_html_format(email_content['body'])
+            msg_alternative.attach(MIMEText(html_body, 'html'))
+            
+            # Attach the alternative part to main message
+            msg.attach(msg_alternative)
             
             # Add attachment
             if os.path.exists(attachment_path):
@@ -483,21 +543,16 @@ class JobApplicationAgent:
     def attach_and_send_email(self, recipient_email, subject, body, attachment_path, action="draft"):
         """General function to attach any file and send/draft email"""
         try:
-            if not self.gmail_tools:
+            if not self.gmail_credentials:
                 return False, "Gmail not connected"
-            
             if not os.path.exists(attachment_path):
                 return False, f"Attachment file not found: {attachment_path}"
-            
             # Create email content structure
             email_content = {
                 "subject": subject,
                 "body": body
             }
-            
-            # Use the internal attachment function
             return self._send_email_with_attachment(recipient_email, email_content, attachment_path, action)
-            
         except Exception as e:
             return False, f"Error in attach_and_send_email: {e}"
     
@@ -514,19 +569,19 @@ def main():
     <style>
     .main-header {
         text-align: center;
-        padding: 0.8rem 0;
+        padding: 1.5rem 0;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
         border-radius: 20px;
         margin-bottom: 1rem;
-        height: 100px;
+        height: 150px;
     }
     .status-box {
         background: white;
         border: 2px solid #e9ecef;
         border-radius: 10px;
-        padding: .1rem 3rem;
-        margin: 0.1rem 20rem;
+        padding: .1rem 2rem;
+        margin: 0.1rem 0rem;
         text-align: center;
         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         color: #000000 !important;
@@ -619,7 +674,7 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
-    # Sidebar for API Key and Email History
+    # Sidebar for API Key, Credentials, and History
     with st.sidebar:
         st.markdown("### 🔑 API Configuration")
         google_api_key = st.text_input(
@@ -630,79 +685,212 @@ def main():
             key="api_key_input"
         )
         
+        # Credentials file upload for Gmail
+        st.markdown("### 📁 Gmail Credentials")
+        credentials_file = st.file_uploader(
+            "Upload credentials.json",
+            type="json",
+            help="Upload your Google Cloud Platform credentials JSON file for Gmail access",
+            key="credentials_upload"
+        )
+        
+        # Store credentials in session and save to file
+        if credentials_file is not None:
+            try:
+                import json
+                credentials_content = json.load(credentials_file)
+                
+                # Save to credentials.json file
+                with open("credentials.json", "w") as f:
+                    json.dump(credentials_content, f, indent=2)
+                
+                # Also store in session for reference
+                st.session_state.credentials_content = credentials_content
+                st.markdown('<div style="background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.7rem; margin: 0.1rem 0; line-height: 1.2;">✅ Credentials uploaded and saved successfully!</div>', unsafe_allow_html=True)
+                st.markdown('<div style="background: #cce5ff; border: 1px solid #99ccff; color: #004085; padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.7rem; margin: 0.1rem 0; line-height: 1.2;">📧 Ready for Gmail authentication</div>', unsafe_allow_html=True)
+                
+            except json.JSONDecodeError:
+                st.markdown('<div style="background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.7rem; margin: 0.1rem 0; line-height: 1.2;">❌ Invalid JSON file. Please upload a valid credentials.json file.</div>', unsafe_allow_html=True)
+            except Exception as e:
+                st.markdown(f'<div style="background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.7rem; margin: 0.1rem 0; line-height: 1.2;">❌ Error saving credentials: {e}</div>', unsafe_allow_html=True)
+        
         if not google_api_key:
-            st.markdown('<div style="background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; margin: 0.25rem 0;">Google API key to continue.</div>', unsafe_allow_html=True)
+            st.markdown('<div style="background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.7rem; margin: 0.1rem 0; line-height: 1.2;">⚠️ Please enter your Google API key.</div>', unsafe_allow_html=True)
             st.stop()
         
-        # Initialize agent with API key
-        agent = JobApplicationAgent(google_api_key=google_api_key)
+        # Check if credentials.json exists
+        if not os.path.exists("credentials.json"):
+            st.markdown('<div style="background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; margin: 0.25rem 0;">Please upload your credentials.json file.</div>', unsafe_allow_html=True)
+            st.stop()
+        
+        # Initialize agent with API key only (email comes from Gmail OAuth)
+        agent = JobApplicationAgent(google_api_key=google_api_key, sender_email=None)
         
         # Gmail setup
         gmail_status, gmail_msg = agent.setup_gmail_auth()
         if gmail_status:
-            st.markdown('<div style="background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; margin: 0.25rem 0;">Gmail connected successfully!</div>', unsafe_allow_html=True)
+            st.markdown('<div style="background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.7rem; margin: 0.1rem 0; line-height: 1.2;">✅ Gmail connected successfully!</div>', unsafe_allow_html=True)
         else:
-            st.markdown('<div style="background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; margin: 0.25rem 0;">⚠️ Gmail connection failed</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.7rem; margin: 0.1rem 0; line-height: 1.2;">❌ Gmail connection failed: {gmail_msg}</div>', unsafe_allow_html=True)
         
         st.markdown("---")
         
-        # Email History in sidebar
-        if st.checkbox("📊 Show Email History"):
-            history = load_email_history()
-            if history:
-                st.markdown("### 📜 Recent Emails")
-                for i, email in enumerate(reversed(history[-5:]), 1):
-                    if isinstance(email, dict):
-                        with st.expander(f"Email {i}"):
-                            st.write(f"**To:** {email.get('recipient', 'Unknown')}")
-                            st.write(f"**Subject:** {email.get('subject', 'No Subject')}")
-                            st.write(f"**Action:** {email.get('action', 'Unknown')}")
-            else:
-                st.info("No email history found.")
+        # Email History with slider
+        st.markdown("### � Activity History")
+        # history = load_email_history()  # REMOVED - session only
+        init_session_history()
+        if st.session_state.activity_history:  # Changed to session
+            # Display session history directly (no authentication needed)
+            history = st.session_state.activity_history  # Use session history
+            st.markdown(f"*Showing all {len(history)} session activities*")
+            
+            # Show all activities with enhanced display
+            for i, entry in enumerate(reversed(history), 1):
+                if isinstance(entry, dict):
+                    # Determine entry type
+                    entry_type = entry.get('type', 'email')
+                    timestamp = entry.get('timestamp', 'Unknown time')
+                    
+                    if entry_type == 'analysis':
+                        # Analysis Card
+                        st.markdown(f"""
+                        <div style="border: 1px solid #4CAF50; border-radius: 6px; padding: 8px; margin: 5px 0; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);">
+                            <div style="display: flex; align-items: center; margin-bottom: 5px;">
+                                <span style="font-size: 16px; margin-right: 8px;">🔍</span>
+                                <div>
+                                    <h5 style="margin: 0; color: #2e7d32; font-size: 0.8rem;">Analysis #{i}</h5>
+                                    <small style="color: #666; font-size: 0.65rem;">{timestamp}</small>
+                                </div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Expandable content for analysis
+                        with st.expander(f"📊 View Full Analysis Results", expanded=False):
+                            st.markdown("#### Analysis Details")
+                            st.write(f"**Status:** {entry.get('status', 'Completed')}")
+                            
+                            if entry.get('job_title'):
+                                st.write(f"**Job Title:** {entry.get('job_title')}")
+                            
+                            if entry.get('match_score'):
+                                st.write(f"**Match Score:** {entry.get('match_score')}")
+                            
+                            if entry.get('summary'):
+                                st.markdown("#### Full Analysis Summary")
+                                st.text_area("", value=entry.get('summary'), height=300, disabled=True, key=f"analysis_summary_{i}")
+                                
+                            if entry.get('user_email'):
+                                st.write(f"**User:** {entry.get('user_email')}")
+                    else:
+                        # Email Card
+                        action = entry.get('action', 'Unknown').title()
+                        recipient = entry.get('recipient', 'Unknown')
+                        
+                        st.markdown(f"""
+                        <div style="border: 1px solid #2196F3; border-radius: 6px; padding: 8px; margin: 5px 0; background: linear-gradient(135deg, #f8f9fa 0%, #e3f2fd 100%);">
+                            <div style="display: flex; align-items: center; margin-bottom: 5px;">
+                                <span style="font-size: 16px; margin-right: 8px;">📧</span>
+                                <div>
+                                    <h5 style="margin: 0; color: #1565c0; font-size: 0.8rem;">Email {action} #{i}</h5>
+                                    <small style="color: #666; font-size: 0.65rem;">{timestamp}</small>
+                                </div>
+                            </div>
+                            <p style="margin: 3px 0; color: #333; font-size: 0.7rem;"><strong>To:</strong> {recipient}</p>
+                            <p style="margin: 3px 0; color: #333; font-size: 0.7rem;"><strong>Subject:</strong> {entry.get('subject', 'No Subject')}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Expandable content for email
+                        with st.expander(f"📝 View Full Email Content", expanded=False):
+                            st.markdown("#### Email Details")
+                            st.write(f"**To:** {entry.get('recipient', 'Unknown')}")
+                            st.write(f"**Subject:** {entry.get('subject', 'No Subject')}")
+                            st.write(f"**Action:** {entry.get('action', 'Unknown').title()}")
+                            st.write(f"**Status:** {entry.get('status', 'Unknown')}")
+                            
+                            if entry.get('body'):
+                                st.markdown("#### Full Email Body")
+                                st.text_area("", value=entry.get('body'), height=400, disabled=True, key=f"email_body_{i}")
+                                
+                            if entry.get('user_email'):
+                                st.write(f"**Sender:** {entry.get('user_email')}")
+                else:
+                    st.info("No activity history found yet.")
+        
+        # Session Management
+        st.markdown("---")
+        st.markdown("### 🧹 Session Management")
+        if st.button("Clear All Session Data", type="secondary", help="Clear inputs, history, and all session data"):
+            clear_session_data()
+            st.success("Session data cleared!")
+            st.rerun()
     
-    # Main input form
-    with st.form("job_application_form", clear_on_submit=False):
-        # Status Display Box - Default state (inside form)
-        st.markdown("""
-        <div class="status-box">
-            <h4>🎯 Ready to Process Your Application</h4>
-        </div>
-        """, unsafe_allow_html=True)
+    # Main input interface - persistent until browser closes
+    # Status Display Box
+    st.markdown("""
+    <div class="status-box">
+        <h4>🎯 Ready to Process Your Application</h4>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<div class="input-section">', unsafe_allow_html=True)
+    
+    # Three main inputs with session state persistence
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        st.markdown("### 📄 Upload Resume")
+        uploaded_file = st.file_uploader("Choose PDF file", type="pdf", help="Upload your resume in PDF format", key="resume_upload")
+        # Store file in session for persistence
+        if uploaded_file is not None:
+            st.session_state.uploaded_file_data = uploaded_file.getbuffer()
+            st.session_state.uploaded_file_name = uploaded_file.name
+    
+    with col2:
+        st.markdown("### 📝 Job Description")
+        # Initialize session state for job description
+        if 'job_desc_text' not in st.session_state:
+            st.session_state.job_desc_text = ""
         
-        st.markdown('<div class="input-section">', unsafe_allow_html=True)
+        manual_job_desc = st.text_area("Paste Job Description", 
+                                     value=st.session_state.job_desc_text,
+                                     placeholder="Copy the complete job description from any job site and paste here...", 
+                                     height=100, 
+                                     help="Copy the full job description text from the job posting",
+                                     key="job_desc_input")
+        # Update session when changed
+        if manual_job_desc != st.session_state.job_desc_text:
+            st.session_state.job_desc_text = manual_job_desc
+    
+    with col3:
+        st.markdown("### 📧 Recipient Email")
+        # Initialize session state for recipient email
+        if 'recipient_email_text' not in st.session_state:
+            st.session_state.recipient_email_text = ""
         
-        # Three main inputs
-        col1, col2, col3 = st.columns([1, 1, 1])
-        
-        with col1:
-            st.markdown("### 📄 Upload Resume")
-            uploaded_file = st.file_uploader("Choose PDF file", type="pdf", help="Upload your resume in PDF format", key="resume_upload")
-        
-        with col2:
-            st.markdown("### 📝 Job Description")
-            manual_job_desc = st.text_area("Paste Job Description", 
-                                         placeholder="Copy the complete job description from any job site and paste here...", 
-                                         height=100, 
-                                         help="Copy the full job description text from the job posting",
-                                         key="job_desc_input")
-        
-        with col3:
-            st.markdown("### 📧 Recipient Email")
-            recipient_email = st.text_input("Recruiter's email", placeholder="recruiter@company.com", help="Enter the recruiter's email address", key="email_input")
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Action buttons
-        col_analyze, col_draft, col_send = st.columns([1, 1, 1])
-        
-        with col_analyze:
-            analyze_clicked = st.form_submit_button("🔍 Analyze Match", use_container_width=True, type="secondary")
-        
-        with col_draft:
-            draft_clicked = st.form_submit_button("📝 Create Draft", use_container_width=True, type="secondary")
-        
-        with col_send:
-            send_clicked = st.form_submit_button("📨 Send Email", use_container_width=True, type="primary")
+        recipient_email = st.text_input("Recruiter's email", 
+                                       value=st.session_state.recipient_email_text,
+                                       placeholder="recruiter@company.com", 
+                                       help="Enter the recruiter's email address", 
+                                       key="email_input")
+        # Update session when changed
+        if recipient_email != st.session_state.recipient_email_text:
+            st.session_state.recipient_email_text = recipient_email
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Action buttons (not in form for persistence)
+    col_analyze, col_draft, col_send = st.columns([1, 1, 1])
+    
+    with col_analyze:
+        analyze_clicked = st.button("🔍 Analyze Match", use_container_width=True, type="secondary")
+    
+    with col_draft:
+        draft_clicked = st.button("📝 Create Draft", use_container_width=True, type="secondary")
+    
+    with col_send:
+        send_clicked = st.button("📨 Send Email", use_container_width=True, type="primary")
     
     # Process actions
     if analyze_clicked or draft_clicked or send_clicked:
@@ -735,8 +923,8 @@ def main():
         if 'email_content' not in st.session_state:
             st.session_state.email_content = None
         
-        # Validate inputs
-        if not uploaded_file:
+        # Validate inputs (check both current upload and session data)
+        if not uploaded_file and 'uploaded_file_data' not in st.session_state:
             st.error("❌ Please upload your resume")
             st.stop()
         
@@ -757,11 +945,33 @@ def main():
         status_text = st.empty()
         
         try:
-            # Step 1: Process Resume
+            # Step 1: Process Resume (handle both current upload and session data)
             status_text.text("📄 Processing resume...")
             progress_bar.progress(20)
             
-            resume_success, resume_msg = agent.process_resume(uploaded_file)
+            if uploaded_file:
+                # Fresh upload
+                resume_success, resume_msg = agent.process_resume(uploaded_file)
+            elif 'uploaded_file_data' in st.session_state:
+                # Use session data - create temporary file
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                    temp_file.write(st.session_state.uploaded_file_data)
+                    temp_file.flush()
+                    
+                    # Create a file-like object
+                    class SessionFile:
+                        def __init__(self, path, name):
+                            self.name = name
+                            self._path = path
+                        def getbuffer(self):
+                            with open(self._path, 'rb') as f:
+                                return f.read()
+                    
+                    session_file = SessionFile(temp_file.name, st.session_state.uploaded_file_name)
+                    resume_success, resume_msg = agent.process_resume(session_file)
+            else:
+                resume_success, resume_msg = False, "No resume found"
             if not resume_success:
                 st.error(f"❌ {resume_msg}")
                 st.stop()
@@ -777,7 +987,7 @@ def main():
             
             st.info("✅ Job description loaded successfully")
             
-            # Step 3: Analyze Match (always do this)
+            # Step 3: Analyze Match (always run, but only show for analyze_clicked)
             status_text.text("🔍 Analyzing job match...")
             progress_bar.progress(60)
             
@@ -786,8 +996,23 @@ def main():
                 st.error(f"❌ {analysis_result}")
                 st.stop()
             
-            # Store analysis result in session state
-            st.session_state.analysis_result = analysis_result
+            # Only store and show analysis for analyze button, run silently for draft/send
+            if analyze_clicked:
+                # Store analysis result in session state for display
+                st.session_state.analysis_result = analysis_result
+                st.session_state.show_analysis = True  # Flag to show analysis results
+                
+                # Save analysis to session history
+                add_to_session_history({
+                    "type": "analysis",
+                    "status": "completed",
+                    "summary": analysis_result,
+                    "job_title": manual_job_desc[:100] if len(manual_job_desc) > 100 else manual_job_desc,
+                    "match_score": "Analysis completed"
+                })
+            else:
+                # For draft/send, analysis runs in background but results are not displayed
+                st.session_state.show_analysis = False
             
             # Step 4: Email actions (if requested)
             if draft_clicked or send_clicked:
@@ -820,13 +1045,14 @@ def main():
                     success_msg = f"✅ Email {'drafted' if draft_clicked else 'sent'} successfully with PDF attachment!"
                     st.markdown(f'<div class="success-box">{success_msg}<br><small>{send_result}</small></div>', unsafe_allow_html=True)
                     
-                    # Save to email history
-                    save_email_history({
+                    # Save to session history
+                    add_to_session_history({
+                        "type": "email",
                         "recipient": recipient_email,
                         "subject": email_content['subject'],
-                        "body": email_content['body'][:200] + "..." if len(email_content['body']) > 200 else email_content['body'],
+                        "body": email_content['body'],
                         "action": action,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        "status": "success"
                     })
                     
 
@@ -865,10 +1091,12 @@ def main():
             """, unsafe_allow_html=True)
     
     # Display persistent results
-    if st.session_state.get('analysis_result'):
-        st.markdown("### � Job Match Analysis")
+    # Only show analysis if it was explicitly requested (analyze button clicked)
+    if st.session_state.get('analysis_result') and st.session_state.get('show_analysis', False):
+        st.markdown("### 🔍 Job Match Analysis")
         st.markdown(f'<div class="success-box">{st.session_state.analysis_result}</div>', unsafe_allow_html=True)
     
+    # Always show email content if available (for draft/send operations)
     if st.session_state.get('email_content'):
         st.markdown("### 📧 Generated Email")
         st.markdown(f"**Subject:** {st.session_state.email_content['subject']}")
